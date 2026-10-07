@@ -19,6 +19,14 @@ from tqdm import tqdm
 from networks.inception import InceptionV3
 
 
+def psnr_from_mse(mse, max_value=1.0):
+    if mse < 0:
+        raise ValueError('MSE must be non-negative')
+    if mse == 0:
+        return float('inf')
+    return 10 * np.log10(max_value ** 2 / mse)
+
+
 def get_activations(images, model, batch_size=64, dims=2048,
                     cuda=False, verbose=False):
     """Calculates the activations of the pool_3 layer for all images.
@@ -239,7 +247,7 @@ def get_inpainting_metrics(src, tgt, get_fid=True):
             print(p1)
             print(p2)
         mae_ = np.mean(abs(img1 / 255.0 - img2 / 255.0))
-        psnr_ = max_value - 10 * np.log(mse_ + 1e-7) / np.log(10)
+        psnr_ = psnr_from_mse(mse_, max_value)
         ssim_ = compare_ssim(rgb2gray(img1), rgb2gray(img2))
         psnrs.append(psnr_)
         ssims.append(ssim_)

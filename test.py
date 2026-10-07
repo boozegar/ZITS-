@@ -40,6 +40,87 @@ def main(args, config):
         checkpoint = torch.load(args.ckpt_resume, map_location='cpu')
         utils.torch_init_model(model, checkpoint, key='state_dict')
 
+    def adapter_state_from_checkpoint(path, source, prefix):
+        adapter_checkpoint = torch.load(path, map_location='cpu')
+        if adapter_checkpoint.get('format') == 'zitspp_joint_peft_compact_v1':
+            source_state = adapter_checkpoint[source]
+            return {
+                key[len(prefix):]: value
+                for key, value in source_state.items()
+                if key.startswith(prefix)
+            }
+        state_dict = adapter_checkpoint.get('state_dict', adapter_checkpoint)
+        full_prefix = '{}.{}'.format(source, prefix)
+        return {
+            key[len(full_prefix):]: value
+            for key, value in state_dict.items()
+            if key.startswith(full_prefix)
+        }
+
+    if args.sa_adapter_ckpt:
+        adapter_state = adapter_state_from_checkpoint(
+            args.sa_adapter_ckpt,
+            args.sa_adapter_source,
+            'GCs.spatial_adapters.',
+        )
+        active_ftr = model.ftr_ema if args.use_ema else model.ftr
+        expected = set(active_ftr.GCs.spatial_adapters.state_dict())
+        if set(adapter_state) != expected:
+            raise RuntimeError(
+                'SA adapter checkpoint mismatch: missing={} unexpected={}'.format(
+                    sorted(expected - set(adapter_state)),
+                    sorted(set(adapter_state) - expected),
+                )
+            )
+        current = active_ftr.GCs.spatial_adapters.state_dict()
+        with torch.no_grad():
+            for key, value in adapter_state.items():
+                current[key].copy_(value)
+        print("Loaded SA adapter ({}): {}".format(args.sa_adapter_source, args.sa_adapter_ckpt))
+
+    if args.dense_decoder_adapter_ckpt:
+        adapter_state = adapter_state_from_checkpoint(
+            args.dense_decoder_adapter_ckpt,
+            args.dense_decoder_adapter_source,
+            'G.dense_guidance_adapters.',
+        )
+        active_ftr = model.ftr_ema if args.use_ema else model.ftr
+        expected = set(active_ftr.G.dense_guidance_adapters.state_dict())
+        if set(adapter_state) != expected:
+            raise RuntimeError(
+                'Dense decoder adapter checkpoint mismatch: missing={} unexpected={}'.format(
+                    sorted(expected - set(adapter_state)),
+                    sorted(set(adapter_state) - expected),
+                )
+            )
+        current = active_ftr.G.dense_guidance_adapters.state_dict()
+        with torch.no_grad():
+            for key, value in adapter_state.items():
+                current[key].copy_(value)
+        print(
+            "Loaded dense decoder adapter ({}): {}".format(
+                args.dense_decoder_adapter_source,
+                args.dense_decoder_adapter_ckpt,
+            )
+        )
+
+    if args.tsr_adapter_ckpt:
+        adapter_checkpoint = torch.load(args.tsr_adapter_ckpt, map_location='cpu')
+        adapter_state = adapter_checkpoint[args.tsr_adapter_source]
+        expected = set(model.edgeline_tsr.mask_adapters.state_dict())
+        if set(adapter_state) != expected:
+            raise RuntimeError(
+                'TSR adapter checkpoint mismatch: missing={} unexpected={}'.format(
+                    sorted(expected - set(adapter_state)),
+                    sorted(set(adapter_state) - expected),
+                )
+            )
+        current = model.edgeline_tsr.mask_adapters.state_dict()
+        with torch.no_grad():
+            for key, value in adapter_state.items():
+                current[key].copy_(value)
+        print("Loaded TSR mask adapter ({}): {}".format(args.tsr_adapter_source, args.tsr_adapter_ckpt))
+
     if hasattr(model, "wf"):
         model.wf.load_state_dict(torch.load(args.wf_ckpt, map_location='cpu')['model'])
 
@@ -153,6 +234,14 @@ if __name__ == '__main__':
     args.add_argument('--use_ema', action='store_true', help='Whether to use ema?')
     args.add_argument('--ckpt_resume', default='last.ckpt', type=str, help='PL path to restore')
     args.add_argument('--wf_ckpt', type=str, default=None, help='Line detector weights')
+    args.add_argument('--sa_adapter_ckpt', type=str, default=None, help='External SA-ZeroRA adapter checkpoint')
+    args.add_argument('--sa_adapter_source', choices=['ftr', 'ftr_ema'], default='ftr_ema')
+    args.add_argument('--dense_decoder_adapter_ckpt', type=str, default=None, help='External dense decoder adapter checkpoint')
+    args.add_argument('--dense_decoder_adapter_source', choices=['ftr', 'ftr_ema'], default='ftr_ema')
+    args.add_argument('--dense_decoder_guidance', choices=['mask-only', 'edge', 'gradient', 'line', 'full'], default=None)
+    args.add_argument('--dense_decoder_stages', nargs='+', choices=['256', '128', '64'], default=None)
+    args.add_argument('--tsr_adapter_ckpt', type=str, default=None, help='External TSR mask adapter checkpoint')
+    args.add_argument('--tsr_adapter_source', choices=['adapter', 'adapter_ema'], default='adapter_ema')
     args.add_argument('--save_path', default='outputs', type=str, help='path to save')
     args.add_argument('--img_dir', type=str, default=None, help='Test image path')
     args.add_argument('--mask_dir', type=str, default=None, help='Mask path')
@@ -169,6 +258,18 @@ if __name__ == '__main__':
     assert args.mask_dir is not None
     args.resume = None
     config = ConfigParser.from_args(args, mkdir=False)
+    if args.dense_decoder_guidance is not None:
+        guidance_names = {
+            'mask-only': (),
+            'edge': ('edge',),
+            'gradient': ('gradientx', 'gradienty'),
+            'line': ('line',),
+            'full': ('edge', 'gradientx', 'gradienty', 'line'),
+        }[args.dense_decoder_guidance]
+        config.config['g_args']['dense_decoder_zero_ra']['guidance_names'] = guidance_names
+    if args.dense_decoder_stages is not None:
+        stage_indices = tuple({'256': 0, '128': 1, '64': 2}[value] for value in args.dense_decoder_stages)
+        config.config['g_args']['dense_decoder_zero_ra']['enabled_stages'] = stage_indices
     SEED = 123456
     torch.manual_seed(SEED)
 

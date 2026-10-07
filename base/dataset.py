@@ -143,9 +143,9 @@ class InpaintingDataset(torch.utils.data.Dataset):
                     mask_index1 = random.randint(0, len(self.segment_mask_list) - 1)
                     mask_index2 = random.randint(0, len(self.irregular_mask_list) - 1)
                     mask1 = cv2.imread(self.segment_mask_list[mask_index1],
-                                       cv2.IMREAD_GRAYSCALE).astype(np.float)
+                                       cv2.IMREAD_GRAYSCALE).astype(float)
                     mask2 = cv2.imread(self.irregular_mask_list[mask_index2],
-                                       cv2.IMREAD_GRAYSCALE).astype(np.float)
+                                       cv2.IMREAD_GRAYSCALE).astype(float)
                     mask2 = cv2.resize(mask2, (mask1.shape[1], mask1.shape[0]), interpolation=cv2.INTER_NEAREST)
                     mask = np.clip(mask1 + mask2, 0, 255).astype(np.uint8)
 
@@ -194,7 +194,7 @@ class InpaintingDataset(torch.utils.data.Dataset):
 
             if os.path.isfile(flist):
                 try:
-                    return np.genfromtxt(flist, dtype=np.str, encoding='utf-8')
+                    return np.genfromtxt(flist, dtype=str, encoding='utf-8')
                 except:
                     return [flist]
 
@@ -490,9 +490,9 @@ class DynamicDataset_gradient_line(torch.utils.data.Dataset):
                     mask_index1 = random.randint(0, len(self.segment_mask_list) - 1)
                     mask_index2 = random.randint(0, len(self.irregular_mask_list) - 1)
                     mask1 = cv2.imread(self.segment_mask_list[mask_index1],
-                                       cv2.IMREAD_GRAYSCALE).astype(np.float)
+                                       cv2.IMREAD_GRAYSCALE).astype(float)
                     mask2 = cv2.imread(self.irregular_mask_list[mask_index2],
-                                       cv2.IMREAD_GRAYSCALE).astype(np.float)
+                                       cv2.IMREAD_GRAYSCALE).astype(float)
                     mask2 = cv2.resize(mask2, (mask1.shape[1], mask1.shape[0]), interpolation=cv2.INTER_NEAREST)
                     mask = np.clip(mask1 + mask2, 0, 255).astype(np.uint8)
 
@@ -541,7 +541,7 @@ class DynamicDataset_gradient_line(torch.utils.data.Dataset):
 
             if os.path.isfile(flist):
                 try:
-                    return np.genfromtxt(flist, dtype=np.str, encoding='utf-8')
+                    return np.genfromtxt(flist, dtype=str, encoding='utf-8')
                 except:
                     return [flist]
 
@@ -570,21 +570,32 @@ class DynamicDataset_gradient_line(torch.utils.data.Dataset):
 
 
     def load_gradient(self, img):
-        sobelx = cv2.Sobel(img, cv2.CV_64F, 1, 0).astype(np.float)
-        sobely = cv2.Sobel(img, cv2.CV_64F, 0, 1).astype(np.float)
+        sobelx = cv2.Sobel(img, cv2.CV_64F, 1, 0).astype(float)
+        sobely = cv2.Sobel(img, cv2.CV_64F, 0, 1).astype(float)
         return sobelx, sobely
 
     def load_wireframe(self, idx, size):
         selected_img_name = self.data[idx]
-        line_name = selected_img_name.split("/")
-        ns = line_name[-1]
-        if self.training is False:
-            line_name[4] = self.eval_line_path
+        wireframe_root = self.eval_line_path if self.training is False else self.train_line_path
+        if os.path.isabs(wireframe_root):
+            normalized = selected_img_name.replace('\\', '/')
+            relative = None
+            for marker in ('/imgs/datasets/', '/data/datasets/'):
+                if marker in normalized:
+                    relative = normalized.split(marker, 1)[1]
+                    break
+            if relative is None:
+                relative = os.path.basename(normalized)
+            line_name = os.path.join(wireframe_root, os.path.splitext(relative)[0] + '.pkl')
         else:
-            line_name[4] = self.train_line_path
-        line_name = line_name[:5] + line_name[6:]  # + [ns]
-        line_name = "/".join(line_name).replace('.png', '.pkl').replace('.jpg', '.pkl')
-        line_name = line_name.replace('/imgs/', '/')
+            line_name = selected_img_name.split("/")
+            if self.training is False:
+                line_name[4] = self.eval_line_path
+            else:
+                line_name[4] = self.train_line_path
+            line_name = line_name[:5] + line_name[6:]
+            line_name = "/".join(line_name).replace('.png', '.pkl').replace('.jpg', '.pkl')
+            line_name = line_name.replace('/imgs/', '/')
 
         wf = pickle.load(open(line_name, 'rb'))
         lmap = np.zeros((size, size))

@@ -1,7 +1,33 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .transformer_layers import BlockAxial, my_Block_2, model_config
+
+
+class MaskAwareTSRAdapter(nn.Module):
+    """Hole-local residual adapter for the frozen TSR bottleneck."""
+
+    def __init__(self, channels=256, hidden_channels=64):
+        super().__init__()
+        self.project_in = nn.Conv2d(channels + 1, hidden_channels, kernel_size=1)
+        self.spatial = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=3,
+            padding=1,
+            groups=hidden_channels,
+        )
+        self.project_out = nn.Conv2d(hidden_channels, channels, kernel_size=1)
+        nn.init.zeros_(self.project_out.weight)
+        nn.init.zeros_(self.project_out.bias)
+
+    def forward(self, features, masks):
+        hole = F.interpolate(masks, size=features.shape[-2:], mode="nearest")
+        residual = torch.cat((features, hole), dim=1)
+        residual = F.silu(self.project_in(residual))
+        residual = F.silu(self.spatial(residual))
+        return torch.tanh(self.project_out(residual)) * hole
 
 
 class EdgeLineGPT256RelBCE_edge_pred_infer(nn.Module):
@@ -28,6 +54,9 @@ class EdgeLineGPT256RelBCE_edge_pred_infer(nn.Module):
             self.blocks.append(BlockAxial(config))
             self.blocks.append(my_Block_2(config))
         self.blocks = nn.Sequential(*self.blocks)
+        self.mask_adapters = nn.ModuleList(
+            [MaskAwareTSRAdapter(channels=256, hidden_channels=64) for _ in self.blocks]
+        )
         # decoder, input: 32*32*config.n_embd
         self.ln_f = nn.LayerNorm(256)
 
@@ -46,6 +75,9 @@ class EdgeLineGPT256RelBCE_edge_pred_infer(nn.Module):
         self.config = config
 
         self.apply(self._init_weights)
+        for adapter in self.mask_adapters:
+            nn.init.zeros_(adapter.project_out.weight)
+            nn.init.zeros_(adapter.project_out.bias)
 
     def get_block_size(self):
         return self.block_size
@@ -59,7 +91,7 @@ class EdgeLineGPT256RelBCE_edge_pred_infer(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, img_idx, line_idx, masks=None):
+    def forward_logits(self, img_idx, line_idx, masks=None):
         img_idx = img_idx * (1 - masks)
         line_idx = line_idx * (1 - masks)
         x = torch.cat((img_idx, line_idx, masks), dim=1)
@@ -83,7 +115,9 @@ class EdgeLineGPT256RelBCE_edge_pred_infer(nn.Module):
         x = self.drop(x + position_embeddings)  # [b,hw,c]
         x = x.permute(0, 2, 1).reshape(b, c, h, w)
 
-        x = self.blocks(x)
+        for block, adapter in zip(self.blocks, self.mask_adapters):
+            x = block(x)
+            x = x + adapter(x, masks)
         x = x.permute(0, 2, 3, 1)
         x = self.ln_f(x).permute(0, 3, 1, 2).contiguous()
 
@@ -100,6 +134,11 @@ class EdgeLineGPT256RelBCE_edge_pred_infer(nn.Module):
         x = self.convt4(x)
 
         edge, line = torch.split(x, [1, 1], dim=1)
+
+        return edge, line
+
+    def forward(self, img_idx, line_idx, masks=None):
+        edge, line = self.forward_logits(img_idx, line_idx, masks=masks)
 
         edge, line = self.act_last(edge), self.act_last(line)
         return edge, line

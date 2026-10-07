@@ -24,6 +24,20 @@ from .nms_temp import get_nms as get_np_nms
 from .nms_torch import get_nms as get_torch_nms
 
 
+def _trainer_world_size(trainer):
+    num_nodes = getattr(trainer, 'num_nodes', 1)
+    if hasattr(trainer, 'num_processes'):
+        num_procs = trainer.num_processes
+    elif hasattr(trainer, 'num_devices'):
+        num_procs = trainer.num_devices
+    elif hasattr(trainer, 'devices'):
+        devices = trainer.devices
+        num_procs = len(devices) if isinstance(devices, (list, tuple)) else int(devices)
+    else:
+        num_procs = 1
+    return int(num_nodes) * int(num_procs)
+
+
 def add_prefix_to_keys(dct, prefix):
     return {prefix + k: v for k, v in dct.items()}
 
@@ -384,7 +398,7 @@ class PLTrainer(ptl.LightningModule):
         self.G.train()
 
     def get_ddp_rank(self):
-        return self.trainer.global_rank if (self.trainer.num_nodes * self.trainer.num_processes) > 1 else None
+        return self.trainer.global_rank if _trainer_world_size(self.trainer) > 1 else None
 
 
 class FinetunePLTrainer(ptl.LightningModule):
@@ -409,6 +423,10 @@ class FinetunePLTrainer(ptl.LightningModule):
         self.use_ema = use_ema
         self.dynamic_size = dynamic_size
         self.config = config['trainer']
+        self.trainable_ftr_prefixes = tuple(
+            self.config.get('trainable_ftr_prefixes', [])
+        ) or None
+        self._set_ftr_trainable(True)
         self.data_class = config['data_class']
         self.data_args = config['dataset']
         self.data_args['pos_num'] = config['g_args']['rel_pos_num']
@@ -445,6 +463,26 @@ class FinetunePLTrainer(ptl.LightningModule):
         # global buffers for Training
         self.img_size = 256
         self.gen_img_for_train = None
+
+    def _set_ftr_trainable(self, enabled):
+        if not enabled:
+            self.ftr.requires_grad_(False)
+            return
+        if self.trainable_ftr_prefixes is None:
+            self.ftr.requires_grad_(True)
+            return
+        self.ftr.requires_grad_(False)
+        matched = 0
+        for name, parameter in self.ftr.named_parameters():
+            if any(name.startswith(prefix) for prefix in self.trainable_ftr_prefixes):
+                parameter.requires_grad_(True)
+                matched += parameter.numel()
+        if matched == 0:
+            raise RuntimeError(
+                'No FTR parameters matched trainable prefixes: {}'.format(
+                    self.trainable_ftr_prefixes
+                )
+            )
 
     def reset_ema(self):
         self.ftr_ema = copy.deepcopy(self.ftr)
@@ -555,7 +593,12 @@ class FinetunePLTrainer(ptl.LightningModule):
 
     def configure_optimizers(self):
         opt_args = self.args['optimizer']
-        g_optimizer = torch.optim.Adam(self.ftr.parameters(), lr=opt_args['g_opt']['lr'],
+        generator_parameters = [
+            parameter for parameter in self.ftr.parameters() if parameter.requires_grad
+        ]
+        if not generator_parameters:
+            raise RuntimeError('Generator optimizer has no trainable parameters')
+        g_optimizer = torch.optim.Adam(generator_parameters, lr=opt_args['g_opt']['lr'],
                                        betas=(opt_args['g_opt']['beta1'], opt_args['g_opt']['beta2']), eps=1e-8)
         d_optimizer = torch.optim.Adam(self.D.parameters(), lr=opt_args['d_opt']['lr'],
                                        betas=(opt_args['d_opt']['beta1'], opt_args['d_opt']['beta2']), eps=1e-8)
@@ -651,12 +694,16 @@ class FinetunePLTrainer(ptl.LightningModule):
         return items
 
     def training_step(self, batch, batch_idx, optimizer_idx=None):
-        if self.global_step % self.sample_period == 0 and optimizer_idx == 0:
+        if (
+            not self.config.get('disable_samples', False)
+            and self.global_step % self.sample_period == 0
+            and optimizer_idx == 0
+        ):
             self._sample(batch)
         self.img_size = batch['image'].shape[-1]
 
         if optimizer_idx == 0:  # step for generator
-            self.ftr.requires_grad_(True)
+            self._set_ftr_trainable(True)
             self.D.requires_grad_(False)
             batch = self.inpaint_prior(batch)
             loss, loss_dict = self.train_G(batch)
@@ -686,9 +733,9 @@ class FinetunePLTrainer(ptl.LightningModule):
         self.log_dict(log_info, on_step=True, on_epoch=False)
 
         # show learning rate
-        sche = self.trainer.lr_schedulers
-        self.g_lr = sche[0]['scheduler'].get_lr()[0]
-        self.d_lr = sche[1]['scheduler'].get_lr()[0]
+        if getattr(self.trainer, 'optimizers', None):
+            self.g_lr = self.trainer.optimizers[0].param_groups[0]['lr']
+            self.d_lr = self.trainer.optimizers[1].param_groups[0]['lr']
 
         return full_loss
 
@@ -710,7 +757,7 @@ class FinetunePLTrainer(ptl.LightningModule):
         self.ftr.train()
 
     def validation_epoch_end(self, outputs):
-        if (self.trainer.num_nodes * self.trainer.num_processes) > 1:
+        if _trainer_world_size(self.trainer) > 1:
             dist.barrier()
         if self.trainer.is_global_zero:
             self.metric = get_inpainting_metrics(self.eval_path, self.test_path)
@@ -786,7 +833,7 @@ class FinetunePLTrainer(ptl.LightningModule):
         self.ftr.train()
 
     def get_ddp_rank(self):
-        return self.trainer.global_rank if (self.trainer.num_nodes * self.trainer.num_processes) > 1 else None
+        return self.trainer.global_rank if _trainer_world_size(self.trainer) > 1 else None
 
 
 def to_device(data, device):
